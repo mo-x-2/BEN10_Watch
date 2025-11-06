@@ -26,6 +26,10 @@ static float g_window[ModelSettings::kWindowSize * ModelSettings::kChannelCount]
 static float g_input[ModelSettings::kInputElementCount];
 static float g_scores[ModelSettings::kNumClasses];
 static uint8_t g_tensor_arena[TENSOR_ARENA_SIZE];
+static char g_last_gesture = '?';
+static uint32_t g_last_ml_log_ms = 0;   // ML定期ログ用
+static uint32_t g_last_bt_log_ms = 0;   // BT送信の定期ログ
+static uint32_t g_last_imu_warn_ms = 0; // IMU read失敗の抑制ログ
 
 // ML推論用のタイミング制御
 unsigned long g_last_sample_ms = 0;
@@ -49,8 +53,8 @@ const int SERVO_PIN   = 17;   // FS90 signal
 
 // -------------------- SERVO CONFIG -------------------
 Servo servo;
-const int SERVO_OPEN_ANGLE  = 0;   // angle to hold while open
-const int SERVO_CLOSE_ANGLE = 60;  // angle when closed
+const int SERVO_OPEN_ANGLE  = 50;   // angle to hold while open
+const int SERVO_CLOSE_ANGLE = 110;  // angle when closed
 const int SERVO_MIN_US = 500;      // FS90 typical range
 const int SERVO_MAX_US = 2500;
 
@@ -63,6 +67,8 @@ int8_t   symbolIndex        = 0;    // 0..3
 int32_t  lastHandledSteps   = 0;
 bool     systemEnabled      = false; // true only in OPEN_ACTIVE
 bool     interruptsAttached = false;
+bool     hrGateEnabled      = true;   // true: HR優先でOPEN待ち / false: IMU優先（以降はHR不要）
+bool     g_bt_connected_prev = false; // BT接続状態の変化検知
 
 // ====== STATE MACHINE ======
 enum RunState { CLOSED_IDLE, OPEN_ACTIVE, COOLDOWN };
@@ -90,6 +96,8 @@ int      beatAvg = 0;
 
 bool hrAbove100 = false;       // evaluated from beatAvg
 // ============================================================================
+// デバッグ用: 心拍センサーの状態を定期出力
+uint32_t lastHrLogMs = 0;
 
 // -------------------- ENCODER ISR --------------------
 IRAM_ATTR void isrEncoder() {
@@ -110,6 +118,7 @@ void attachEncoderInterrupts() {
     attachInterrupt(digitalPinToInterrupt(ENC_PIN_A), isrEncoder, CHANGE);
     attachInterrupt(digitalPinToInterrupt(ENC_PIN_B), isrEncoder, CHANGE);
     interruptsAttached = true;
+    Serial.println(F("ENC: attached"));
   }
 }
 
@@ -118,6 +127,7 @@ void detachEncoderInterrupts() {
     detachInterrupt(digitalPinToInterrupt(ENC_PIN_A));
     detachInterrupt(digitalPinToInterrupt(ENC_PIN_B));
     interruptsAttached = false;
+    Serial.println(F("ENC: detached"));
   }
 }
 
@@ -158,6 +168,12 @@ void updateHeartRateFlag() {
   // If no finger detected (very low signal), relax flag (state machine decides behavior)
   if (irValue < 5000) {
     hrAbove100 = false;
+    // 指未装着/信号弱いときのデバッグ出力（1秒に1回）
+    uint32_t now = millis();
+    if (now - lastHrLogMs >= 1000) {
+      Serial.printf("HR: IR=%ld (no finger or low signal)\n", irValue);
+      lastHrLogMs = now;
+    }
     return;
   }
 
@@ -178,7 +194,7 @@ void updateHeartRateFlag() {
         for (byte i = 0; i < RATE_SIZE; i++) sum += rates[i];
         beatAvg = sum / RATE_SIZE;
 
-        hrAbove100 = (beatAvg > 90);
+        hrAbove100 = (beatAvg > 70);
 
         // Debug (optional)
         Serial.print(F("BPM: "));
@@ -190,13 +206,20 @@ void updateHeartRateFlag() {
       }
     }
   }
+
+  // 指ありだが拍が取れていない場合のフォールバックログ（1秒に1回）
+  uint32_t now2 = millis();
+  if (now2 - lastHrLogMs >= 1000) {
+    Serial.printf("HR: IR=%ld waiting for beat...\n", irValue);
+    lastHrLogMs = now2;
+  }
 }
 
 // -------------------- SETUP --------------------------
 void setup() {
   Serial.begin(115200);
 
-  // --- OLED bus (Wire) on SDA=21, SCL=22 ---
+  // --- OLED/IMU I2C bus (use board-defined SDA/SCL pins) ---
   Wire.begin(21, 22);
   Wire.setClock(400000);
 
@@ -237,7 +260,7 @@ void setup() {
 
   // MPU6050 (IMU) init for ML inference
   Serial.println(F("Initializing MPU6050..."));
-  bool ok = AccelerometerHandler::begin(0x68, 21, 22, 400000);
+  bool ok = AccelerometerHandler::begin(0x68, SDA, SCL, 400000);
   if (!ok) {
     Serial.println(F("MPU6050 init failed"));
     // ML inference will be skipped, but other functions continue
@@ -273,7 +296,14 @@ void updateMLInference() {
   g_last_sample_ms = now;
 
   AccelSample s;
-  if (!AccelerometerHandler::read(s)) return;
+  if (!AccelerometerHandler::read(s)) {
+    uint32_t nowWarn = millis();
+    if (nowWarn - g_last_imu_warn_ms >= 1000) {
+      Serial.println(F("IMU: read failed"));
+      g_last_imu_warn_ms = nowWarn;
+    }
+    return;
+  }
   float sample[ModelSettings::kChannelCount] = {s.ax, s.ay, s.az};
   g_ring.push(sample);
 
@@ -311,35 +341,66 @@ void updateMLInference() {
       // 閾値未満の場合はN（通常動作）
       gestureChar = 'N';
     }
+
+    // 直近の結果から変化したときに出力
+    if (gestureChar != g_last_gesture) {
+      Serial.printf("ML Result: %c (%.3f) - Scores: W:%.3f, O:%.3f, L:%.3f, N:%.3f\n",
+                    gestureChar, best_score, g_scores[0], g_scores[1], g_scores[2], g_scores[3]);
+      g_last_gesture = gestureChar;
+      g_last_ml_log_ms = millis();
+    }
+    // 変化がなくても1秒ごとに定期ログを出して継続稼働を可視化
+    uint32_t nowLog = millis();
+    if (nowLog - g_last_ml_log_ms >= 1000) {
+      Serial.printf("ML Result: %c (%.3f) - Scores: W:%.3f, O:%.3f, L:%.3f, N:%.3f\n",
+                    gestureChar, best_score, g_scores[0], g_scores[1], g_scores[2], g_scores[3]);
+      g_last_ml_log_ms = nowLog;
+    }
   }
 
   // Bluetoothで送信: "G:<W|O|L|N>;S:<0|1|2|3>\n"
   // G: ジェスチャー, S: symbolIndex
   if (BTServer.hasClient()) {
     BTServer.printf("G:%c;S:%d\n", gestureChar, symbolIndex);
+    uint32_t nowBt = millis();
+    if (nowBt - g_last_bt_log_ms >= 1000) {
+      Serial.printf("BT TX: G:%c;S:%d\n", gestureChar, symbolIndex);
+      g_last_bt_log_ms = nowBt;
+    }
   }
 }
 
 // -------------------- LOOP ---------------------------
 void loop() {
-  // Update HR (ignored during cooldown by state machine)
-  updateHeartRateFlag();
-
-  // Update ML inference (runs continuously)
-  updateMLInference();
-
   bool switchOpen = (digitalRead(SWITCH_PIN) == HIGH); // HIGH=open, LOW=closed
+
+  // Bluetooth接続状態変化ログ
+  bool btNow = BTServer.hasClient();
+  if (btNow != g_bt_connected_prev) {
+    Serial.println(btNow ? F("BT: client connected") : F("BT: client disconnected"));
+    g_bt_connected_prev = btNow;
+  }
 
   switch (state) {
     case CLOSED_IDLE: {
-      // Wait for HR trigger (>100) to open
-      if (hrAbove100) {
+      if (hrGateEnabled) {
+        // HR優先フェーズ: HRのみ更新（IMU推論は走らせない）
+        updateHeartRateFlag();
+      } else {
+        // 2回目以降: 閉じていてもIMU推論を回し続ける（BT送信も継続）
+        updateMLInference();
+      }
+      // Wait for HR trigger (>100) to open（hrGateEnabledがtrueのときのみ有効）
+      if (hrGateEnabled && hrAbove100) {
         systemEnabled = true;
         servoGoTo(SERVO_OPEN_ANGLE);  // open FIRST (mechanism pops; switch will open mechanically)
         encSteps = 0; lastHandledSteps = 0;
         attachEncoderInterrupts();
         turnDisplayOnAndShow();
         state = OPEN_ACTIVE;
+        Serial.println(F("STATE -> OPEN_ACTIVE"));
+        hrGateEnabled = false; // 一度OPENしたら以降はIMU優先モードへ
+        Serial.println(F("MODE: IMU priority (HR disabled)"));
       } else {
         // ensure off while closed
         systemEnabled = false;
@@ -351,8 +412,16 @@ void loop() {
     }
 
     case OPEN_ACTIVE: {
+      // IMU優先フェーズ: IMU推論のみ更新（HRは停止）
+      updateMLInference();
       // Stay open regardless of HR until user closes watch (switch goes LOW)
       if (!switchOpen) {
+        // 最終選択をログ／BT通知
+        Serial.printf("ALIEN SELECTED: %d\n", symbolIndex);
+        if (BTServer.hasClient()) {
+          BTServer.printf("SEL:%d\n", symbolIndex);
+          Serial.printf("BT TX: SEL:%d\n", symbolIndex);
+        }
         // Transition to COOLDOWN
         systemEnabled = false;
         detachEncoderInterrupts();
@@ -366,6 +435,7 @@ void loop() {
 
         cooldownStartMs = millis();
         state = COOLDOWN;
+        Serial.println(F("STATE -> COOLDOWN"));
       } else {
         // While open: handle encoder steps & update display
         noInterrupts();
@@ -379,12 +449,14 @@ void loop() {
           lastHandledSteps += STEPS_PER_SYMBOL;
           delta -= STEPS_PER_SYMBOL;
           drawAlien(symbolIndex);
+          Serial.printf("Alien: %d\n", symbolIndex);
         }
         while (delta <= -STEPS_PER_SYMBOL) {
           symbolIndex = (symbolIndex + 3) & 0x03; // (-1 mod 4)
           lastHandledSteps -= STEPS_PER_SYMBOL;
           delta += STEPS_PER_SYMBOL;
           drawAlien(symbolIndex);
+          Serial.printf("Alien: %d\n", symbolIndex);
         }
       }
       break;
@@ -399,6 +471,7 @@ void loop() {
 
       if (millis() - cooldownStartMs >= COOLDOWN_MS) {
         state = CLOSED_IDLE;  // ready for next cycle
+        Serial.println(F("STATE -> CLOSED_IDLE"));
       }
       break;
     }
