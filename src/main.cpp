@@ -4,7 +4,35 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <ESP32Servo.h>
-#include <alien.h>         // your bitmap set
+#include "../alien.h"         // your bitmap set
+#include <BluetoothSerial.h>
+
+// ================== ML Inference (MagicWand) ==================
+#include "accelerometer_handler.h"
+#include "ring_buffer.h"
+#include "feature_provider.h"
+#include "model_settings.h"
+#include "tflite_wrapper.h"
+#include "magic_wand_model_data.h"
+
+#ifndef TENSOR_ARENA_SIZE
+#define TENSOR_ARENA_SIZE (70*1024)
+#endif
+
+// ML推論用のバッファとリングバッファ
+static float g_ring_storage[ModelSettings::kWindowSize * ModelSettings::kChannelCount];
+static FloatRingBuffer g_ring(g_ring_storage, ModelSettings::kWindowSize, ModelSettings::kChannelCount);
+static float g_window[ModelSettings::kWindowSize * ModelSettings::kChannelCount];
+static float g_input[ModelSettings::kInputElementCount];
+static float g_scores[ModelSettings::kNumClasses];
+static uint8_t g_tensor_arena[TENSOR_ARENA_SIZE];
+
+// ML推論用のタイミング制御
+unsigned long g_last_sample_ms = 0;
+const unsigned long kSamplePeriodMs = 1000 / ModelSettings::kSampleRateHz;
+
+// Bluetooth サーバ
+BluetoothSerial BTServer;
 
 // -------------------- OLED CONFIG (Bus: Wire on 21/22) --------------------
 #define SCREEN_WIDTH 128
@@ -207,6 +235,29 @@ void setup() {
     Serial.println(F("Place finger gently on the sensor."));
   }
 
+  // MPU6050 (IMU) init for ML inference
+  Serial.println(F("Initializing MPU6050..."));
+  bool ok = AccelerometerHandler::begin(0x68, 21, 22, 400000);
+  if (!ok) {
+    Serial.println(F("MPU6050 init failed"));
+    // ML inference will be skipped, but other functions continue
+  } else {
+    Serial.println(F("MPU6050 ready"));
+  }
+
+  // TFLite init
+  Serial.println(F("Initializing TFLite..."));
+  if (!TFLiteWrapper::init(g_magic_wand_model_data, g_magic_wand_model_data_len, g_tensor_arena, sizeof(g_tensor_arena))) {
+    Serial.println(F("TFLite init failed (check model and arena size)"));
+    // ML inference will be skipped, but other functions continue
+  } else {
+    Serial.println(F("TFLite ready"));
+  }
+
+  // Bluetooth サーバ開始
+  BTServer.begin("ESP32_Server");
+  Serial.println(F("Bluetooth Server Started (ESP32_Server)"));
+
   // Start CLOSED by assumption
   state = CLOSED_IDLE;
   systemEnabled = false;
@@ -215,10 +266,57 @@ void setup() {
   servo.write(SERVO_CLOSE_ANGLE);
 }
 
+// -------------------- ML INFERENCE --------------------
+void updateMLInference() {
+  unsigned long now = millis();
+  if (now - g_last_sample_ms < kSamplePeriodMs) return;
+  g_last_sample_ms = now;
+
+  AccelSample s;
+  if (!AccelerometerHandler::read(s)) return;
+  float sample[ModelSettings::kChannelCount] = {s.ax, s.ay, s.az};
+  g_ring.push(sample);
+
+  if (!g_ring.full()) return;
+
+  g_ring.latestWindow(g_window);
+  FeatureProvider::normalize(g_window, ModelSettings::kWindowSize, ModelSettings::kChannelCount);
+  FeatureProvider::flatten(g_window, ModelSettings::kWindowSize, ModelSettings::kChannelCount, g_input);
+
+  // 推論実行
+  char gestureChar = 'N';
+  if (TFLiteWrapper::invoke(g_input, ModelSettings::kInputElementCount, g_scores, ModelSettings::kNumClasses)) {
+    // ベストクラス決定
+    int best_class = 0;
+    float best_score = g_scores[0];
+    for (int i = 1; i < ModelSettings::kNumClasses; ++i) {
+      if (g_scores[i] > best_score) { best_score = g_scores[i]; best_class = i; }
+    }
+    // ラベルに対応（0:W,1:O,2:L）しきい値0.7
+    const float kThreshold = 0.7f;
+    if (best_score >= kThreshold) {
+      if (best_class == 0) gestureChar = 'W';
+      else if (best_class == 1) gestureChar = 'O';
+      else if (best_class == 2) gestureChar = 'L';
+    } else {
+      gestureChar = 'N';
+    }
+  }
+
+  // Bluetoothで送信: "G:<W|O|L|N>;S:<0|1|2|3>\n"
+  // G: ジェスチャー, S: symbolIndex
+  if (BTServer.hasClient()) {
+    BTServer.printf("G:%c;S:%d\n", gestureChar, symbolIndex);
+  }
+}
+
 // -------------------- LOOP ---------------------------
 void loop() {
   // Update HR (ignored during cooldown by state machine)
   updateHeartRateFlag();
+
+  // Update ML inference (runs continuously)
+  updateMLInference();
 
   bool switchOpen = (digitalRead(SWITCH_PIN) == HIGH); // HIGH=open, LOW=closed
 
