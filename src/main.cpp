@@ -286,19 +286,29 @@ void updateMLInference() {
   // 推論実行
   char gestureChar = 'N';
   if (TFLiteWrapper::invoke(g_input, ModelSettings::kInputElementCount, g_scores, ModelSettings::kNumClasses)) {
-    // ベストクラス決定
+    // ラベルに対応（0:W, 1:O, 2:L, 3:N）
+    // 画像データに基づき、N以外のクラス（W/O/L）を検出するための統合閾値
+    // W: 0.000-0.465, O: 0.001-0.072, L: 0.000-0.001 の範囲を考慮して閾値を0.05に設定
+    const float kGestureThreshold = 0.05f;
+    
+    // N以外のクラスを優先的に検出（W/O/Lのスコアが閾値を超えているかチェック）
+    // ベストクラスを決定し、そのスコアが閾値を超えていれば検出
     int best_class = 0;
     float best_score = g_scores[0];
-    for (int i = 1; i < ModelSettings::kNumClasses; ++i) {
-      if (g_scores[i] > best_score) { best_score = g_scores[i]; best_class = i; }
+    for (int i = 1; i < ModelSettings::kNumClasses - 1; ++i) { // N(3)を除くW/O/Lのみチェック
+      if (g_scores[i] > best_score) {
+        best_score = g_scores[i];
+        best_class = i;
+      }
     }
-    // ラベルに対応（0:W,1:O,2:L）しきい値0.7
-    const float kThreshold = 0.7f;
-    if (best_score >= kThreshold) {
+    
+    // W/O/Lのいずれかが閾値を超えていれば検出
+    if (best_score >= kGestureThreshold) {
       if (best_class == 0) gestureChar = 'W';
       else if (best_class == 1) gestureChar = 'O';
       else if (best_class == 2) gestureChar = 'L';
     } else {
+      // 閾値未満の場合はN（通常動作）
       gestureChar = 'N';
     }
   }
